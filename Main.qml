@@ -5,16 +5,58 @@ import QtQuick.Dialogs
 
 ApplicationWindow {
     id: root
-    width: 900
-    height: 740
+    // FHD (1920x1080) の画面で、横にエクスプローラーを並べてドラッグ&ドロップできるサイズ。
+    // 表示スケール 125% などで画面が狭いときは、画面に収まるよう縮める
+    width: Math.min(1100, Screen.width - 200)
+    height: Math.min(800, Screen.height - 160)
     minimumWidth: 720
     minimumHeight: 580
     visible: true
+    // 画面中央に置く（OS 任せだと下端がタスクバーに隠れることがある）
+    Component.onCompleted: {
+        x = Screen.virtualX + (Screen.width - width) / 2
+        y = Screen.virtualY + Math.max(0, (Screen.height - height) / 2 - 10)
+    }
     title: "Mp3ToTxt - 音声文字起こし"
     color: "#0d1117"
 
-    property string selectedFileUrl: ""
     property bool hasResult: transcriptionManager.result !== ""
+    property bool editMode: false
+
+    readonly property var queue: transcriptionManager.queue
+    readonly property var selectedItem: (transcriptionManager.selectedIndex >= 0 && transcriptionManager.selectedIndex < queue.length)
+                                        ? queue[transcriptionManager.selectedIndex] : null
+    readonly property bool selectedDone: selectedItem !== null && selectedItem.status === "done"
+    readonly property int doneCount: queue.filter(function(it) { return it.status === "done" }).length
+
+    readonly property var statusLabels: ({
+        pending: "待機", running: "処理中", done: "完了", empty: "文字なし", error: "エラー", cancelled: "中止"
+    })
+    readonly property var statusColors: ({
+        pending: "#6e7681", running: "#58a6ff", done: "#3fb950", empty: "#8b949e", error: "#f85149", cancelled: "#d29922"
+    })
+
+    function enterEditMode() {
+        resultArea.text = transcriptionManager.result   // バインディングを外して編集用に保持
+        root.editMode = true
+        transcriptionManager.editing = true
+        resultArea.forceActiveFocus()
+    }
+    function finishEditMode(apply) {
+        if (apply)
+            transcriptionManager.applyEdit(resultArea.text)
+        root.editMode = false
+        transcriptionManager.editing = false
+        resultArea.text = Qt.binding(function() { return transcriptionManager.result })
+    }
+    // 全置換。置換した件数を返す
+    function replaceAll(findText, replaceText) {
+        if (findText === "") return 0
+        var parts = resultArea.text.split(findText)
+        if (parts.length > 1)
+            resultArea.text = parts.join(replaceText)
+        return parts.length - 1
+    }
 
     readonly property var langCodes: ["auto", "ja", "en", "zh", "ko", "fr", "de", "es"]
 
@@ -22,12 +64,19 @@ ApplicationWindow {
 
     FileDialog {
         id: openDialog
-        title: "音声ファイルを選択"
+        title: "音声ファイルを選択（複数選択可）"
+        fileMode: FileDialog.OpenFiles
         nameFilters: [
             "音声ファイル (*.mp3 *.wav *.m4a *.ogg *.flac *.webm *.mp4)",
             "すべてのファイル (*)"
         ]
-        onAccepted: root.selectedFileUrl = selectedFile.toString()
+        onAccepted: transcriptionManager.setSources(selectedFiles)
+    }
+
+    FolderDialog {
+        id: folderDialog
+        title: "音声ファイルが入ったフォルダを選択"
+        onAccepted: transcriptionManager.setSources([selectedFolder])
     }
 
 
@@ -101,12 +150,23 @@ ApplicationWindow {
         Rectangle { Layout.fillWidth: true; height: 1; color: "#21262d" }
 
         ScrollView {
+            id: mainScroll
+            // 高さは外側のレイアウトで決める（中身の高さに連動させると Binding loop になる）
+            implicitHeight: 100
             Layout.fillWidth: true; Layout.fillHeight: true
             contentWidth: availableWidth
+            contentHeight: mainContent.height
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
+            // ウインドウが大きいときは表示範囲いっぱいまで伸ばし、余りを結果欄に回す
+            Item {
+                id: mainContent
+                width: mainScroll.availableWidth
+                height: Math.max(mainColumn.implicitHeight, mainScroll.height)
+
             ColumnLayout {
-                width: parent.width
+                id: mainColumn
+                anchors.fill: parent
                 spacing: 14
 
                 Item { height: 4 }
@@ -181,9 +241,10 @@ ApplicationWindow {
                             Text { text: "モデル"; color: "#8b949e"; font.pixelSize: 12 }
                             ComboBox {
                                 id: modelCombo
-                                model: ["tiny  (高速・低精度)", "base", "small  (推奨)", "medium  (高精度)", "large-v3  (最高精度)"]
-                                readonly property var values: ["tiny", "base", "small", "medium", "large-v3"]
-                                currentIndex: 2   // small default
+                                model: ["tiny  (高速・低精度)", "base", "small", "medium", "large-v3-turbo  (推奨)", "large-v3  (最高精度・低速)"]
+                                readonly property var values: ["tiny", "base", "small", "medium", "large-v3-turbo", "large-v3"]
+                                // 保存済みの設定を復元（見つからなければ small）
+                                currentIndex: values.indexOf(transcriptionManager.modelSize) >= 0 ? values.indexOf(transcriptionManager.modelSize) : 2
                                 implicitWidth: 190; implicitHeight: 30
                                 onCurrentIndexChanged: transcriptionManager.modelSize = values[currentIndex]
                                 background: Rectangle { color: "#0d1117"; radius: 6; border.color: parent.down ? "#58a6ff" : "#30363d"; border.width: 1 }
@@ -208,23 +269,30 @@ ApplicationWindow {
 
                 // --- File drop zone ---
                 Rectangle {
+                    id: dropZone
                     Layout.fillWidth: true
                     Layout.leftMargin: 20; Layout.rightMargin: 20
                     height: 108
                     radius: 8
-                    color: dropArea.containsDrag ? "#1c2d3f" : (root.selectedFileUrl !== "" ? "#0d1f10" : "#161b22")
-                    border.color: dropArea.containsDrag ? "#58a6ff" : (root.selectedFileUrl !== "" ? "#3fb950" : "#30363d")
+                    readonly property bool hasFiles: root.queue.length > 0
+                    // 処理中・修正中はファイルを差し替えない
+                    readonly property bool accepting: !transcriptionManager.isProcessing && !root.editMode
+                    color: dropArea.containsDrag ? "#1c2d3f" : (hasFiles ? "#0d1f10" : "#161b22")
+                    border.color: dropArea.containsDrag ? "#58a6ff" : (hasFiles ? "#3fb950" : "#30363d")
                     border.width: dropArea.containsDrag ? 2 : 1
+                    opacity: accepting ? 1.0 : 0.6
                     Behavior on color { ColorAnimation { duration: 120 } }
                     Behavior on border.color { ColorAnimation { duration: 120 } }
 
                     DropArea {
                         id: dropArea
                         anchors.fill: parent
-                        onDropped: { if (drop.hasUrls && drop.urls.length > 0) root.selectedFileUrl = drop.urls[0].toString() }
+                        enabled: dropZone.accepting
+                        onDropped: (drop) => { if (drop.hasUrls) transcriptionManager.setSources(drop.urls) }
                     }
                     MouseArea {
                         anchors.fill: parent
+                        enabled: dropZone.accepting
                         cursorShape: Qt.PointingHandCursor
                         onClicked: openDialog.open()
                     }
@@ -232,28 +300,54 @@ ApplicationWindow {
                         anchors.centerIn: parent; spacing: 4
                         Text {
                             Layout.alignment: Qt.AlignHCenter
-                            text: root.selectedFileUrl !== "" ? "\u2713" : "+"
+                            text: dropZone.hasFiles ? "\u2713" : "+"
                             font.pixelSize: 24
-                            color: root.selectedFileUrl !== "" ? "#3fb950" : "#484f58"
+                            color: dropZone.hasFiles ? "#3fb950" : "#484f58"
                         }
                         Text {
                             Layout.alignment: Qt.AlignHCenter
-                            text: root.selectedFileUrl !== "" ? transcriptionManager.getFileName(root.selectedFileUrl) : "ここにファイルをドロップ、またはクリックして選択"
-                            color: root.selectedFileUrl !== "" ? "#3fb950" : "#c9d1d9"
-                            font.pixelSize: 13; font.bold: root.selectedFileUrl !== ""
+                            text: root.queue.length === 0 ? "ここにファイル・フォルダをドロップ、またはクリックして選択"
+                                : root.queue.length === 1 ? root.queue[0].name
+                                : root.queue.length + " 件のファイル"
+                            color: dropZone.hasFiles ? "#3fb950" : "#c9d1d9"
+                            font.pixelSize: 13; font.bold: dropZone.hasFiles
+                            elide: Text.ElideMiddle
+                            Layout.maximumWidth: dropZone.width - 40
                         }
                         Text {
                             Layout.alignment: Qt.AlignHCenter
-                            visible: root.selectedFileUrl !== ""
-                            text: { var s = transcriptionManager.getFileSize(root.selectedFileUrl); return s < 1048576 ? (s/1024).toFixed(1)+" KB" : (s/1048576).toFixed(1)+" MB" }
+                            visible: root.queue.length === 1
+                            text: { if (root.queue.length !== 1) return ""; var s = transcriptionManager.getFileSize(root.queue[0].path); return s < 1048576 ? (s/1024).toFixed(1)+" KB" : (s/1048576).toFixed(1)+" MB" }
                             color: "#6e7681"; font.pixelSize: 11
                         }
                         Text {
                             Layout.alignment: Qt.AlignHCenter
-                            visible: root.selectedFileUrl === ""
-                            text: "MP3 / WAV / M4A / OGG / FLAC / WEBM"
+                            visible: root.queue.length !== 1
+                            text: root.queue.length > 1 ? "下の一覧の順（名前順）に処理します" : "MP3 / WAV / M4A / OGG / FLAC / WEBM / MP4"
                             color: "#484f58"; font.pixelSize: 11
                         }
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 20; Layout.rightMargin: 20
+                    Layout.topMargin: -6
+                    spacing: 8
+                    Item { Layout.fillWidth: true }
+                    Button {
+                        text: "ファイルを選択"; implicitWidth: 110; implicitHeight: 28
+                        enabled: dropZone.accepting
+                        background: Rectangle { color: parent.pressed ? "#21262d" : "#161b22"; radius: 6; border.color: "#30363d"; border.width: 1 }
+                        contentItem: Text { text: parent.text; color: parent.enabled ? "#c9d1d9" : "#484f58"; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        onClicked: openDialog.open()
+                    }
+                    Button {
+                        text: "フォルダを選択"; implicitWidth: 110; implicitHeight: 28
+                        enabled: dropZone.accepting
+                        background: Rectangle { color: parent.pressed ? "#21262d" : "#161b22"; radius: 6; border.color: "#30363d"; border.width: 1 }
+                        contentItem: Text { text: parent.text; color: parent.enabled ? "#c9d1d9" : "#484f58"; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        onClicked: folderDialog.open()
                     }
                 }
 
@@ -268,19 +362,22 @@ ApplicationWindow {
 
                         Button {
                             Layout.fillWidth: true; implicitHeight: 40
-                            enabled: !transcriptionManager.isProcessing && root.selectedFileUrl !== ""
+                            // 修正中に開始すると、全件やり直しで修正内容が消えることがあるため無効化
+                            enabled: !transcriptionManager.isProcessing && !root.editMode && root.queue.length > 0
                             background: Rectangle {
                                 color: parent.enabled ? (parent.pressed ? "#1a7f37" : "#238636") : "#21262d"
                                 radius: 8
                                 Behavior on color { ColorAnimation { duration: 120 } }
                             }
                             contentItem: Text {
-                                text: transcriptionManager.isProcessing ? "処理中..." : "文字起こし開始"
+                                text: transcriptionManager.isProcessing ? "処理中..."
+                                    : root.queue.length > 1 ? root.queue.length + " 件を順番に文字起こし"
+                                    : "文字起こし開始"
                                 color: transcriptionManager.isProcessing ? "#6e7681" : "#ffffff"
                                 font.pixelSize: 14; font.bold: true
                                 horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
                             }
-                            onClicked: transcriptionManager.transcribe(root.selectedFileUrl, root.langCodes[languageCombo.currentIndex])
+                            onClicked: transcriptionManager.start(root.langCodes[languageCombo.currentIndex])
                         }
 
                         Button {
@@ -328,23 +425,169 @@ ApplicationWindow {
                     }
                 }
 
-                // --- Result area ---
+                // --- Queue list (複数ファイル時) ---
                 Rectangle {
                     Layout.fillWidth: true
                     Layout.leftMargin: 20; Layout.rightMargin: 20
-                    implicitHeight: 230
-                    visible: root.hasResult || transcriptionManager.isProcessing
+                    visible: root.queue.length > 1
+                    implicitHeight: queueCol.implicitHeight + 20
                     color: "#161b22"; radius: 8
                     border.color: "#21262d"; border.width: 1
+
+                    ColumnLayout {
+                        id: queueCol
+                        anchors { left: parent.left; right: parent.right; top: parent.top; margins: 10 }
+                        spacing: 6
+
+                        RowLayout {
+                            Layout.fillWidth: true; spacing: 8
+                            Text { text: "ファイル一覧"; color: "#6e7681"; font.pixelSize: 11; font.bold: true }
+                            Text { text: "完了 " + root.doneCount + " / " + root.queue.length; color: "#484f58"; font.pixelSize: 11 }
+                            Item { Layout.fillWidth: true }
+                            Button {
+                                text: "すべて TXT 保存"; implicitWidth: 110; implicitHeight: 26
+                                visible: root.doneCount > 0 && !root.editMode
+                                background: Rectangle { color: parent.pressed ? "#1f6feb" : "#161b22"; radius: 5; border.color: "#58a6ff"; border.width: 1 }
+                                contentItem: Text { text: parent.text; color: "#58a6ff"; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                onClicked: transcriptionManager.saveAllTxt()
+                            }
+                            Button {
+                                text: "すべて PDF 保存"; implicitWidth: 110; implicitHeight: 26
+                                visible: root.doneCount > 0 && !root.editMode
+                                background: Rectangle { color: parent.pressed ? "#6e1c1c" : "#161b22"; radius: 5; border.color: "#f85149"; border.width: 1 }
+                                contentItem: Text { text: parent.text; color: "#f85149"; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                onClicked: transcriptionManager.saveAllPdf()
+                            }
+                        }
+
+                        ListView {
+                            id: queueView
+                            Layout.fillWidth: true
+                            implicitHeight: Math.min(contentHeight, 30 * 7)
+                            clip: true
+                            model: root.queue
+                            ScrollBar.vertical: ScrollBar { policy: queueView.contentHeight > queueView.height ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded }
+
+                            delegate: Rectangle {
+                                required property var modelData
+                                required property int index
+                                readonly property bool selected: index === transcriptionManager.selectedIndex
+                                width: queueView.width - 12
+                                height: 30; radius: 4
+                                color: selected ? "#1c2d3f" : (rowMouse.containsMouse && !root.editMode ? "#1c2128" : "transparent")
+                                border.color: selected ? "#58a6ff" : "transparent"; border.width: 1
+
+                                MouseArea {
+                                    id: rowMouse
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    // 修正中は他のファイルへ切り替えない（未確定の修正を守る）
+                                    enabled: !root.editMode
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: transcriptionManager.selectedIndex = index
+                                }
+                                RowLayout {
+                                    anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
+                                    spacing: 8
+                                    Text { text: (index + 1) + "."; color: "#484f58"; font.pixelSize: 11; Layout.preferredWidth: 26 }
+                                    Text {
+                                        text: modelData.name; color: "#c9d1d9"; font.pixelSize: 12
+                                        elide: Text.ElideMiddle; Layout.fillWidth: true
+                                    }
+                                    Text { text: "(修正済み)"; color: "#d29922"; font.pixelSize: 11; visible: modelData.edited }
+                                    BusyIndicator {
+                                        visible: modelData.status === "running"; running: visible
+                                        implicitWidth: 14; implicitHeight: 14
+                                    }
+                                    Text {
+                                        text: root.statusLabels[modelData.status]
+                                        color: root.statusColors[modelData.status]
+                                        font.pixelSize: 11; font.bold: modelData.status === "running"
+                                        horizontalAlignment: Text.AlignRight
+                                        Layout.preferredWidth: 52
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // --- Result area ---
+                Rectangle {
+                    id: resultBox
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 20; Layout.rightMargin: 20
+                    implicitHeight: root.editMode ? 460 : 230
+                    Layout.minimumHeight: implicitHeight
+                    Layout.fillHeight: true
+                    visible: root.hasResult || (root.selectedItem !== null && root.selectedItem.status !== "pending")
+                    color: "#161b22"; radius: 8
+                    border.color: root.editMode ? "#d29922" : "#21262d"
+                    border.width: root.editMode ? 2 : 1
 
                     ColumnLayout {
                         anchors { fill: parent; margins: 12 }
                         spacing: 8
                         RowLayout {
                             Layout.fillWidth: true
-                            Text { text: "文字起こし結果"; color: "#6e7681"; font.pixelSize: 11; font.bold: true }
-                            Item { Layout.fillWidth: true }
-                            Text { text: transcriptionManager.result.length + " 文字"; color: "#484f58"; font.pixelSize: 11; visible: root.hasResult }
+                            Text {
+                                text: (root.editMode ? "修正モード — 直接編集できます" : "文字起こし結果")
+                                      + (root.queue.length > 1 && root.selectedItem ? "  —  " + root.selectedItem.name : "")
+                                elide: Text.ElideMiddle
+                                Layout.fillWidth: true
+                                color: root.editMode ? "#d29922" : "#6e7681"
+                                font.pixelSize: 11; font.bold: true
+                            }
+                            Text {
+                                text: "(修正済み)"; color: "#d29922"; font.pixelSize: 11
+                                visible: !root.editMode && transcriptionManager.isEdited
+                            }
+                            Text { text: resultArea.length + " 文字"; color: "#484f58"; font.pixelSize: 11; visible: root.hasResult }
+                        }
+
+                        // 選択中のファイルのエラー
+                        Text {
+                            Layout.fillWidth: true
+                            visible: root.selectedItem !== null && root.selectedItem.status === "error"
+                            text: root.selectedItem ? root.selectedItem.error : ""
+                            color: "#f85149"; font.pixelSize: 12; wrapMode: Text.Wrap
+                        }
+
+                        // 修正モード: 一括置換
+                        RowLayout {
+                            Layout.fillWidth: true; spacing: 6
+                            visible: root.editMode
+                            TextField {
+                                id: findField
+                                Layout.fillWidth: true; implicitHeight: 28
+                                placeholderText: "検索する語"
+                                color: "#c9d1d9"; placeholderTextColor: "#484f58"; font.pixelSize: 12
+                                selectByMouse: true
+                                background: Rectangle { color: "#0d1117"; radius: 4; border.color: findField.activeFocus ? "#58a6ff" : "#30363d"; border.width: 1 }
+                                onTextChanged: replaceInfo.text = ""
+                            }
+                            Text { text: "\u2192"; color: "#6e7681"; font.pixelSize: 12 }
+                            TextField {
+                                id: replaceField
+                                Layout.fillWidth: true; implicitHeight: 28
+                                placeholderText: "置換後の語"
+                                color: "#c9d1d9"; placeholderTextColor: "#484f58"; font.pixelSize: 12
+                                selectByMouse: true
+                                background: Rectangle { color: "#0d1117"; radius: 4; border.color: replaceField.activeFocus ? "#58a6ff" : "#30363d"; border.width: 1 }
+                                onAccepted: replaceAllButton.clicked()
+                            }
+                            Button {
+                                id: replaceAllButton
+                                text: "すべて置換"; implicitWidth: 90; implicitHeight: 28
+                                enabled: findField.text !== ""
+                                background: Rectangle { color: parent.pressed ? "#21262d" : "#161b22"; radius: 4; border.color: parent.enabled ? "#58a6ff" : "#30363d"; border.width: 1 }
+                                contentItem: Text { text: parent.text; color: parent.enabled ? "#58a6ff" : "#484f58"; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                onClicked: {
+                                    var n = root.replaceAll(findField.text, replaceField.text)
+                                    replaceInfo.text = n > 0 ? n + " 件置換" : "見つかりません"
+                                }
+                            }
+                            Text { id: replaceInfo; color: "#8b949e"; font.pixelSize: 11; Layout.minimumWidth: 70 }
                         }
                         ScrollView {
                             Layout.fillWidth: true; Layout.fillHeight: true
@@ -353,10 +596,11 @@ ApplicationWindow {
                                 id: resultArea
                                 text: transcriptionManager.result
                                 color: "#c9d1d9"; font.pixelSize: 13
-                                wrapMode: TextEdit.Wrap; readOnly: true
+                                wrapMode: TextEdit.Wrap; readOnly: !root.editMode
+                                selectByMouse: true
                                 placeholderText: "文字起こし結果がここに表示されます..."
-                                background: Rectangle { color: "transparent" }
-                                padding: 0
+                                background: Rectangle { color: root.editMode ? "#0d1117" : "transparent"; radius: 4 }
+                                padding: root.editMode ? 8 : 0
                             }
                         }
                     }
@@ -367,30 +611,66 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     Layout.leftMargin: 20; Layout.rightMargin: 20
                     spacing: 8
-                    visible: root.hasResult
+                    visible: root.selectedDone
 
+                    // --- 修正モード中のボタン ---
+                    Button {
+                        text: "修正を確定"; implicitWidth: 120; implicitHeight: 32
+                        visible: root.editMode
+                        background: Rectangle { color: parent.pressed ? "#1a7f37" : "#238636"; radius: 6 }
+                        contentItem: Text { text: parent.text; color: "#ffffff"; font.pixelSize: 12; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        onClicked: root.finishEditMode(true)
+                    }
+                    Button {
+                        text: "破棄"; implicitWidth: 90; implicitHeight: 32
+                        visible: root.editMode
+                        background: Rectangle { color: parent.pressed ? "#21262d" : "#161b22"; radius: 6; border.color: "#30363d"; border.width: 1 }
+                        contentItem: Text { text: parent.text; color: "#8b949e"; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        onClicked: root.finishEditMode(false)
+                    }
+
+                    // --- 通常時のボタン ---
+                    Button {
+                        text: "修正モード"; implicitWidth: 110; implicitHeight: 32
+                        visible: !root.editMode
+                        background: Rectangle { color: parent.pressed ? "#3d2e00" : "#161b22"; radius: 6; border.color: "#d29922"; border.width: 1 }
+                        contentItem: Text { text: parent.text; color: "#d29922"; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        onClicked: root.enterEditMode()
+                    }
                     Button {
                         text: "TXT で保存"; implicitWidth: 120; implicitHeight: 32
                         background: Rectangle { color: parent.pressed ? "#1f6feb" : "#161b22"; radius: 6; border.color: "#58a6ff"; border.width: 1 }
                         contentItem: Text { text: parent.text; color: "#58a6ff"; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        visible: !root.editMode
                         onClicked: transcriptionManager.saveTxt()
                     }
                     Button {
                         text: "PDF で保存"; implicitWidth: 120; implicitHeight: 32
                         background: Rectangle { color: parent.pressed ? "#6e1c1c" : "#161b22"; radius: 6; border.color: "#f85149"; border.width: 1 }
                         contentItem: Text { text: parent.text; color: "#f85149"; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        visible: !root.editMode
                         onClicked: transcriptionManager.savePdf()
                     }
                     Button {
                         text: "コピー"; implicitWidth: 90; implicitHeight: 32
                         background: Rectangle { color: parent.pressed ? "#21262d" : "#161b22"; radius: 6; border.color: "#30363d"; border.width: 1 }
                         contentItem: Text { text: parent.text; color: "#8b949e"; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        visible: !root.editMode
                         onClicked: { resultArea.selectAll(); resultArea.copy(); resultArea.deselect() }
                     }
                     Item { Layout.fillWidth: true }
+                    Button {
+                        text: "元に戻す"; implicitWidth: 90; implicitHeight: 32
+                        visible: !root.editMode && transcriptionManager.isEdited
+                        background: Rectangle { color: parent.pressed ? "#21262d" : "#161b22"; radius: 6; border.color: "#30363d"; border.width: 1 }
+                        contentItem: Text { text: parent.text; color: "#8b949e"; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                        onClicked: transcriptionManager.revertEdits()
+                    }
                 }
 
-                Item { height: 16 }
+                // 結果欄がないときは、余った高さをここで受けて上に詰める
+                Item { implicitHeight: 16; Layout.fillHeight: !resultBox.visible }
+            }
             }
         }
     }
